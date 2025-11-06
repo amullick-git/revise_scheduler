@@ -1,0 +1,13 @@
+{
+  "name": "revise-scheduler",
+  "version": "1.0.0",
+  "description": "Obsidian plugin: spaced ladder for #revise tasks.",
+  "scripts": {
+    "build": "esbuild main.ts --bundle --outfile=main.js --target=es2020 --format=cjs --external:obsidian",
+    "dev": "esbuild main.ts --bundle --outfile=main.js --target=es2020 --format=cjs --external:obsidian --watch"
+  },
+  "devDependencies": {
+    "esbuild": "^0.23.0",
+    "typescript": "^5.6.3"
+  }
+}
