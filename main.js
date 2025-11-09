@@ -1,4 +1,3 @@
-// main.js
 // Obsidian plugin: Revise Scheduler (Spaced Ladder)
 // Behavior:
 //   #revise      -> +7d    -> #revise_7
@@ -7,29 +6,44 @@
 //   #revise_90   -> +365d  -> #revise_365
 //   #revise_365  -> +365d  -> #revise_365 (repeat yearly)
 //
-// Prevents duplicate scheduling by tagging completed items with #nextscheduled.
+// Notes:
+// - Exact tag detection (longest-first) so "#revise_7" does NOT match "#revise".
+// - Strips prior due tokens (📅, ⏳, ➕) before adding new 📅.
+// - Adds "#nextscheduled" to completed tasks to avoid re-scheduling on future scans.
+// - Per-file lock avoids duplicate appends from closely spaced events.
 
 'use strict';
 
 const obsidian = require('obsidian');
 
+// Stage map
 const STAGES = {
   '#revise':      { nextTag: '#revise_7',   plusDays: 7   },
   '#revise_7':    { nextTag: '#revise_30',  plusDays: 30  },
   '#revise_30':   { nextTag: '#revise_90',  plusDays: 90  },
   '#revise_90':   { nextTag: '#revise_365', plusDays: 365 },
-  '#revise_365':  { nextTag: '#revise_365', plusDays: 365 }, // self-loop yearly
+  '#revise_365':  { nextTag: '#revise_365', plusDays: 365 }, // yearly self-loop
 };
 
-const REVISE_TAGS = ['#revise', '#revise_7', '#revise_30', '#revise_90', '#revise_365'];
+// For fast membership checks if needed later
+const REVISE_SET = new Set(Object.keys(STAGES));
 
+// Regexes
 const TASK_DONE_RE = /^\s*-\s*\[x\]\s+/i;
 const TASK_OPEN_RE = /^\s*-\s*\[\s\]\s+/;
-const DUE_RE = /\s*📅\s*\d{4}-\d{2}-\d{2}/; // matches " 📅 YYYY-MM-DD"
-const REVISE_ANY_RE = /\s+#revise(?:_(?:7|30|90|365))?\b/i;
+
+// Any of the date tokens your notes might carry; we’ll strip before adding a fresh 📅
+const DATE_TOKEN_RE = /\s*(?:📅|⏳|➕)\s*\d{4}-\d{2}-\d{2}/g;
+
+// Exact revise tag extractor: prefer specific tags before bare "#revise"
+const EXTRACT_REVISE_TAG_RE = /(?:#revise_(?:365|90|30|7)\b)|(?:#revise\b)/i;
+
+// Used to strip an existing revise tag (any of the forms)
+const STRIP_REVISE_TAG_RE = /\s+#revise(?:_(?:7|30|90|365))?\b/gi;
+
 const NEXT_SCHEDULED_TAG = '#nextscheduled';
 
-// Simple debounce
+// Simple debounce helper
 function debounce(fn, wait) {
   let t = null;
   return function (...args) {
@@ -38,16 +52,14 @@ function debounce(fn, wait) {
   };
 }
 
+// Per-file in-flight guard to avoid duplicate scheduling when multiple events fire quickly
+const inFlight = new Set();
+
 class ReviseSchedulerPlugin extends obsidian.Plugin {
   async onload() {
+    // Process only on file content modification (fewer duplicates than also hooking metadata changes)
     this.registerEvent(
       this.app.vault.on('modify', this._debouncedProcessFile())
-    );
-    this.registerEvent(
-      this.app.metadataCache.on('changed', (file) => {
-        // metadata change can happen without file content change; still process
-        this._debouncedProcessFile()(file);
-      })
     );
 
     this.addCommand({
@@ -81,85 +93,88 @@ class ReviseSchedulerPlugin extends obsidian.Plugin {
 
   _debouncedProcessFile() {
     return debounce((file) => {
-      // Only markdown files
       if (!file || !(file instanceof obsidian.TFile)) return;
       if (!file.path.toLowerCase().endsWith('.md')) return;
       this.processFile(file).catch((e) => console.error('ReviseScheduler error:', e));
-    }, 400);
+    }, 350);
   }
 
   /**
-   * Reads a file, finds completed revise tasks (not yet #nextscheduled),
-   * creates the next task with computed due date, and tags the completed task
-   * with #nextscheduled to prevent duplicates.
+   * Process a single markdown file:
+   *  - Find completed revise tasks not yet marked #nextscheduled
+   *  - Append the next task with computed due date
+   *  - Mark the completed task with #nextscheduled
    */
   async processFile(file) {
-    let content = await this.app.vault.read(file);
-    const lines = content.split('\n');
+    // per-file lock
+    if (inFlight.has(file.path)) return;
+    inFlight.add(file.path);
 
-    let mutated = false;
-    const out = [];
+    try {
+      let content = await this.app.vault.read(file);
+      const lines = content.split('\n');
 
-    for (let i = 0; i < lines.length; i++) {
-      let line = lines[i];
+      let mutated = false;
+      const out = [];
 
-      // Copy line by default
-      out.push(line);
+      for (let i = 0; i < lines.length; i++) {
+        let line = lines[i];
+        out.push(line); // push original first
 
-      // Only operate on completed tasks that contain a revise tag and are NOT already marked nextscheduled
-      if (
-        TASK_DONE_RE.test(line) &&
-        REVISE_ANY_RE.test(line) &&
-        !line.includes(NEXT_SCHEDULED_TAG)
-      ) {
-        // Determine which revise tag is present
-        const tag = REVISE_TAGS.find((t) => line.toLowerCase().includes(t));
-        if (!tag) continue;
+        // Only act on completed tasks with a revise tag, not already marked nextscheduled
+        if (!TASK_DONE_RE.test(line)) continue;
+        if (line.includes(NEXT_SCHEDULED_TAG)) continue;
 
-        const stage = STAGES[tag.toLowerCase()];
+        const tagMatch = line.match(EXTRACT_REVISE_TAG_RE);
+        if (!tagMatch) continue;
+
+        const tag = tagMatch[0].toLowerCase();
+        if (!REVISE_SET.has(tag)) continue;
+
+        const stage = STAGES[tag];
         if (!stage) continue;
 
-        // Compute next due date from "now"
+        // Compute next due date from now
         const due = obsidian.moment().add(stage.plusDays, 'days').format('YYYY-MM-DD');
 
-        // Build the cloned open task:
-        // 1) make it unchecked
-        // 2) strip any existing revise tag
-        // 3) strip any existing due date token like " 📅 YYYY-MM-DD"
+        // Build next open task:
+        // 1) Convert to open checkbox
+        // 2) Remove any existing revise tag and any due-like tokens (📅/⏳/➕ YYYY-MM-DD)
+        // 3) Trim trailing spaces and normalize to ensure "- [ ] " present
         const clonedBase = line
-          .replace(TASK_DONE_RE, (m) => m.replace('[x]', '[ ]')) // done -> open
-          .replace(REVISE_ANY_RE, '')                            // remove old revise tag
-          .replace(DUE_RE, '');                                  // remove old due
+          .replace(TASK_DONE_RE, (m) => m.replace('[x]', '[ ]'))
+          .replace(STRIP_REVISE_TAG_RE, '')
+          .replace(DATE_TOKEN_RE, '');
 
-        // Normalize trailing spaces
-        const cleanedCloned = clonedBase.replace(/\s+$/, '');
-
-        // Ensure it is a task; if the original was malformed, enforce "- [ ] "
-        const openTask = TASK_OPEN_RE.test(cleanedCloned)
-          ? cleanedCloned
-          : cleanedCloned.replace(/^\s*/, (sp) => `${sp}- [ ] `);
+        const cleaned = clonedBase.replace(/\s+$/, '');
+        const openTask = TASK_OPEN_RE.test(cleaned)
+          ? cleaned
+          : cleaned.replace(/^\s*/, (sp) => `${sp}- [ ] `);
 
         const nextTaskLine = `${openTask} 📅 ${due} ${stage.nextTag}`.trim();
 
-        // Append the new task just below the completed one
+        // Append newly scheduled task directly after the completed one
         out.push(nextTaskLine);
 
-        // Mark original completed task to avoid duplicate rescheduling
-        const markedCompleted = line.includes(NEXT_SCHEDULED_TAG)
-          ? line
-          : `${line} ${NEXT_SCHEDULED_TAG}`.replace(/\s+$/, '');
-        // Replace the just-pushed original line with the marked one
-        out[out.length - 2] = markedCompleted;
+        // Mark the original line as nextscheduled to avoid future re-processing
+        const marked = line.includes(NEXT_SCHEDULED_TAG) ? line : `${line} ${NEXT_SCHEDULED_TAG}`.trimEnd();
+        // Replace the original (which we already pushed) with the marked version
+        out[out.length - 2] = marked;
 
         mutated = true;
       }
-    }
 
-    if (mutated) {
-      const newContent = out.join('\n');
-      if (newContent !== content) {
-        await this.app.vault.modify(file, newContent);
+      if (mutated) {
+        const newContent = out.join('\n');
+        if (newContent !== content) {
+          await this.app.vault.modify(file, newContent);
+        }
       }
+    } catch (e) {
+      console.error('ReviseScheduler processing error:', e);
+    } finally {
+      // release lock
+      inFlight.delete(file.path);
     }
   }
 }
