@@ -1,302 +1,166 @@
 import {
-  App,
-  Editor,
-  MarkdownView,
-  Plugin,
-  TFile,
-  moment,
-  Notice,
+    Plugin,
+    TFile,
+    moment,
+    Notice,
+    MarkdownView,
 } from "obsidian";
 
-/**
- * Revise Scheduler (Spaced Ladder)
- *
- * Stages:
- *   #revise   -> +7d  -> #revise_7
- *   #revise_7 -> +30d -> #revise_30
- *   #revise_30-> +90d -> #revise_90
- *
- * Insert command creates an initial #revise scheduled +1 day.
- * Completed tasks generate their next-stage task unless already marked
- * with #nextscheduled — this prevents duplicate generations on reload/VIM.
- */
-export default class RevisePlugin extends Plugin {
-  private lastCheckedState: Map<string, Map<string, boolean>> = new Map();
-  private isProgrammaticWrite = false;
+// -----------------------------
+// CONFIGURATION
+// -----------------------------
 
-  // Define the spaced repetition ladder
-  private STAGES: Array<{
-    tag: string;
-    nextTag: string | null;
-    offsetDays: number | null;
-  }> = [
-    { tag: "#revise", nextTag: "#revise_7", offsetDays: 7 },
-    { tag: "#revise_7", nextTag: "#revise_30", offsetDays: 30 },
-    { tag: "#revise_30", nextTag: "#revise_90", offsetDays: 90 },
-    { tag: "#revise_90", nextTag: null, offsetDays: null },
-  ];
+const STAGES: Record<string, { nextTag: string; plusDays: number }> = {
+    "#revise":      { nextTag: "#revise_7",   plusDays: 7   },
+    "#revise_7":    { nextTag: "#revise_30",  plusDays: 30  },
+    "#revise_30":   { nextTag: "#revise_90",  plusDays: 90  },
+    "#revise_90":   { nextTag: "#revise_365", plusDays: 365 },
+    "#revise_365":  { nextTag: "#revise_365", plusDays: 365 }, // self-loop yearly
+};
 
-  async onload() {
-    this.addCommand({
-      id: "insert-revise-task",
-      name: "Insert #revise task (scheduled tomorrow)",
-      editorCallback: (editor: Editor) => {
-        this.insertReviseTask(editor);
-      },
+const REVISE_TAGS = [
+    "#revise",
+    "#revise_7",
+    "#revise_30",
+    "#revise_90",
+    "#revise_365",
+];
+
+// Regex
+const TASK_DONE_RE = /^\s*-\s*\[x\]\s+/i;
+const TASK_OPEN_RE = /^\s*-\s*\[\s\]\s+/;
+const DUE_RE = /\s*📅\s*\d{4}-\d{2}-\d{2}/;
+const REVISE_ANY_RE = /\s+#revise(?:_(?:7|30|90|365))?\b/i;
+
+const NEXT_SCHEDULED_TAG = "#nextscheduled";
+
+function debounce<F extends (...args: any[]) => any>(fn: F, wait: number): F {
+    let t: number | null = null;
+    return <F>(function (...args: any[]) {
+        if (t) window.clearTimeout(t);
+        t = window.setTimeout(() => fn(...args), wait);
     });
-
-    // Establish a baseline on file-open to avoid duplicate generation
-    this.registerEvent(
-      this.app.workspace.on("file-open", (file) => {
-        if (!(file instanceof TFile)) return;
-        const cache = this.app.metadataCache.getFileCache(file);
-        const items = cache?.listItems ?? [];
-        const currentMap = this.buildCheckedMapFromCache(items);
-        this.lastCheckedState.set(file.path, currentMap);
-      })
-    );
-
-    // Detect task completions
-    this.registerEvent(
-      this.app.metadataCache.on("changed", (file, _data, cache) => {
-        if (!(file instanceof TFile)) return;
-        if (this.isProgrammaticWrite) return;
-
-        try {
-          const items = cache?.listItems ?? [];
-          const currentMap = this.buildCheckedMapFromCache(items);
-          const path = file.path;
-
-          const prevMap = this.lastCheckedState.get(path);
-
-          // First parse of file: establish baseline
-          if (!prevMap) {
-            this.lastCheckedState.set(path, currentMap);
-            return;
-          }
-
-          // Detect new toggles → done
-          const toggledToDone: Array<{ line: number }> = [];
-          for (const [key, nowChecked] of currentMap.entries()) {
-            const wasChecked = prevMap.get(key) ?? false;
-            if (nowChecked && !wasChecked) {
-              const [lineStr] = key.split(":");
-              toggledToDone.push({ line: Number(lineStr) });
-            }
-          }
-
-          this.lastCheckedState.set(path, currentMap);
-
-          if (toggledToDone.length === 0) return;
-
-          this.handleCompletions(file, toggledToDone).catch(console.error);
-        } catch (err) {
-          console.error("Revise Scheduler error:", err);
-        }
-      })
-    );
-
-    new Notice("Revise Scheduler (spaced ladder) loaded");
-  }
-
-  onunload(): void {
-    this.lastCheckedState.clear();
-  }
-
-  /** Insert initial scheduled #revise task */
-  private insertReviseTask(editor: Editor) {
-    const selection = editor.getSelection();
-    const baseText = selection?.trim().length ? selection.trim() : "Revise";
-    const scheduled = moment().add(1, "day").format("YYYY-MM-DD");
-
-    const line = `- [ ] ${baseText} #revise ⏳ ${scheduled}`;
-    if (selection) {
-      editor.replaceSelection(line);
-    } else {
-      const cursor = editor.getCursor();
-      editor.replaceRange(line + "\n", cursor);
-    }
-
-    new Notice(`Inserted #revise task scheduled for ${scheduled}`);
-  }
-
-  /**
-   * Handle completed tasks:
-   * - If #repeat_N → schedule next after N days.
-   * - If spaced ladder tag → schedule next-stage task.
-   * - Add #nextscheduled to completed tasks so they won't regenerate.
-   */
-  private async handleCompletions(
-    file: TFile,
-    toggled: Array<{ line: number }>
-  ) {
-    const content = await this.app.vault.read(file);
-    const lines = content.split("\n");
-
-    let modified = false;
-    const sorted = [...toggled].sort((a, b) => b.line - a.line);
-
-    const appendTagPreservingBlockId = (line: string, rawTag: string): string => {
-      const tag = rawTag.trim();
-
-      // Do not re-add if already present
-      const hasTag = new RegExp(
-        `(^|\\s)${this.escapeRegex(tag)}(\\s|$)`,
-        "i"
-      ).test(line);
-      if (hasTag) return line;
-
-      let s = line.replace(/\s+$/, ""); // trim trailing spaces
-
-      // If ending with ^blockid, insert before it
-      const idMatch = s.match(/\s\^[A-Za-z0-9._-]+$/);
-      if (idMatch) {
-        return s.replace(
-          /\s\^[A-Za-z0-9._-]+$/,
-          ` ${tag}${idMatch[0]}`
-        );
-      }
-
-      return `${s} ${tag}`;
-    };
-
-    for (const { line } of sorted) {
-      if (line < 0 || line >= lines.length) continue;
-      let original = lines[line];
-
-      // Must be a checked task
-      const checkboxMatch = original.match(/^\s*(?:-|\d+\.)\s*\[([ xX])\]/);
-      if (!checkboxMatch || checkboxMatch[1].trim() === "") continue;
-
-      // Skip already-processed tasks
-      if (/(^|\s)#nextscheduled(\s|$)/i.test(original)) continue;
-
-      // Strip checkbox to get main body text
-      const stripped = original
-        .replace(/^\s*-\s*\[[ xX]\]\s+/, "")
-        .replace(/^\s*\d+\.\s*\[[ xX]\]\s+/, "");
-
-      // 1) Handle #repeat_N
-      const repeatMatch = original.match(/#repeat_(\d+)/);
-      if (repeatMatch && repeatMatch[1]) {
-        const days = parseInt(repeatMatch[1], 10);
-        if (!isNaN(days) && days > 0) {
-          const nextScheduled = moment()
-            .add(days, "days")
-            .format("YYYY-MM-DD");
-
-          const taskTextForNew = stripped
-            .replace(/(?:📅|⏳|✅)\s+\d{4}-\d{2}-\d{2}/g, "")
-            .trim();
-
-          // Mark completed source
-          original = appendTagPreservingBlockId(original, "#nextscheduled");
-          lines[line] = original;
-
-          // Insert next task
-          const newTask = `- [ ] ${taskTextForNew} ⏳ ${nextScheduled}`;
-          lines.splice(line + 1, 0, newTask);
-
-          modified = true;
-          continue;
-        }
-      }
-
-      // 2) Handle spaced ladder
-      const stage = this.findStageTag(original);
-      if (stage) {
-        const mapping = this.STAGES.find((s) => s.tag === stage);
-        if (mapping && mapping.nextTag && mapping.offsetDays) {
-          const nextScheduled = moment()
-            .add(mapping.offsetDays, "days")
-            .format("YYYY-MM-DD");
-
-          const taskTextForNew = stripped
-            .replace(/(?:📅|⏳|✅)\s+\d{4}-\d{2}-\d{2}/g, "")
-            .trim();
-
-          const nextText = this.replaceStageTag(
-            taskTextForNew,
-            stage,
-            mapping.nextTag
-          ).trim();
-
-          // Mark completed source
-          original = appendTagPreservingBlockId(original, "#nextscheduled");
-          lines[line] = original;
-
-          // Insert next task
-          const newTask = `- [ ] ${nextText} ⏳ ${nextScheduled}`;
-          lines.splice(line + 1, 0, newTask);
-
-          modified = true;
-        }
-      }
-    }
-
-    if (modified) {
-      const newContent = lines.join("\n");
-      this.isProgrammaticWrite = true;
-      try {
-        await this.app.vault.modify(file, newContent);
-      } finally {
-        window.setTimeout(
-          () => (this.isProgrammaticWrite = false),
-          50
-        );
-      }
-      new Notice("Created spaced follow-up task(s)");
-    }
-  }
-
-  /** Match most-specific stage tag first */
-  private findStageTag(line: string): string | null {
-    const tagsByLength = [...this.STAGES.map((s) => s.tag)].sort(
-      (a, b) => b.length - a.length
-    );
-    for (const t of tagsByLength) {
-      const re = new RegExp(`(^|\\s)${this.escapeRegex(t)}(\\s|$)`);
-      if (re.test(line)) return t;
-    }
-    return null;
-  }
-
-  /** Replace one ladder tag with the next */
-  private replaceStageTag(
-    text: string,
-    currentTag: string,
-    nextTag: string
-  ): string {
-    const re = new RegExp(
-      `(^|\\s)${this.escapeRegex(currentTag)}(\\s|$)`
-    );
-    if (re.test(text)) {
-      return text.replace(re, (_m, p1, p2) => `${p1}${nextTag}${p2}`);
-    }
-    return `${text} ${nextTag}`.trim();
-  }
-
-  /** Build map of "line:col" → checked?  */
-  private buildCheckedMapFromCache(items: any[]): Map<string, boolean> {
-    const map = new Map<string, boolean>();
-    for (const li of items) {
-      const isTask = li.task !== undefined && li.task !== null;
-      if (!isTask || !li?.position?.start) continue;
-
-      const key = `${li.position.start.line}:${li.position.start.col}`;
-      const checked =
-        typeof li.checked === "boolean"
-          ? li.checked
-          : typeof li.task === "string"
-            ? li.task.toLowerCase() === "x"
-            : false;
-
-      map.set(key, checked);
-    }
-    return map;
-  }
-
-  private escapeRegex(s: string): string {
-    return s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-  }
 }
+
+// -----------------------------
+// PLUGIN CLASS
+// -----------------------------
+
+export default class ReviseSchedulerPlugin extends Plugin {
+    onload() {
+        console.log("Revise Scheduler loaded.");
+
+        this.registerEvent(
+            this.app.vault.on("modify", this._debouncedProcessFile())
+        );
+
+        this.registerEvent(
+            this.app.metadataCache.on("changed", (file) => {
+                this._debouncedProcessFile()(file);
+            })
+        );
+
+        this.addCommand({
+            id: "revise-scheduler-scan-active",
+            name: "Revise Scheduler: Scan Active File",
+            callback: async () => {
+                const file = this.app.workspace.getActiveFile();
+                if (file) {
+                    await this.processFile(file);
+                    new Notice("Revise Scheduler: scanned active file");
+                } else {
+                    new Notice("No active file.");
+                }
+            },
+        });
+
+        this.addCommand({
+            id: "revise-scheduler-scan-vault",
+            name: "Revise Scheduler: Scan Entire Vault",
+            callback: async () => {
+                const files = this.app.vault.getMarkdownFiles();
+                for (const f of files) {
+                    await this.processFile(f);
+                }
+                new Notice("Revise Scheduler: scanned all markdown files");
+            },
+        });
+    }
+
+    onunload() {
+        console.log("Revise Scheduler unloaded.");
+    }
+
+    private _debouncedProcessFile() {
+        return debounce((file: TFile) => {
+            if (!file || !(file instanceof TFile)) return;
+            if (!file.path.toLowerCase().endsWith(".md")) return;
+
+            this.processFile(file).catch((e) =>
+                console.error("ReviseScheduler error:", e)
+            );
+        }, 400);
+    }
+
+    // -----------------------------
+    // CORE LOGIC
+    // -----------------------------
+
+    async processFile(file: TFile) {
+        let content = await this.app.vault.read(file);
+        const lines = content.split("\n");
+
+        let mutated = false;
+        const out: string[] = [];
+
+        for (let i = 0; i < lines.length; i++) {
+            let line = lines[i];
+
+            // Push original
+            out.push(line);
+
+            if (
+                TASK_DONE_RE.test(line) &&
+                REVISE_ANY_RE.test(line) &&
+                !line.includes(NEXT_SCHEDULED_TAG)
+            ) {
+                const tag = REVISE_TAGS.find((t) =>
+                    line.toLowerCase().includes(t)
+                );
+                if (!tag) continue;
+
+                const stage = STAGES[tag.toLowerCase()];
+                if (!stage) continue;
+
+                const due = moment().add(stage.plusDays, "days").format("YYYY-MM-DD");
+
+                // Clone
+                const cloned = line
+                    .replace(TASK_DONE_RE, (m) => m.replace("[x]", "[ ]"))
+                    .replace(REVISE_ANY_RE, "")
+                    .replace(DUE_RE, "")
+                    .replace(/\s+$/, "");
+
+                const openTask = TASK_OPEN_RE.test(cloned)
+                    ? cloned
+                    : cloned.replace(/^\s*/, (sp) => `${sp}- [ ] `);
+
+                const nextLine = `${openTask} 📅 ${due} ${stage.nextTag}`.trim();
+
+                // Insert next scheduled task
+                out.push(nextLine);
+
+                // Mark original completed task to avoid duplicates
+                const marked = `${line} ${NEXT_SCHEDULED_TAG}`.replace(/\s+$/, "");
+                out[out.length - 2] = marked;
+
+                mutated = true;
+            }
+        }
+
+        if (mutated) {
+            const newContent = out.join("\n");
+            if (newContent !== content) {
+                await this.app.vault.modify(file, newContent);
+            }
+        }
