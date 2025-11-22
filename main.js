@@ -18,11 +18,11 @@ const obsidian = require('obsidian');
 
 // Stage map
 const STAGES = {
-  '#revise':      { nextTag: '#revise_7',   plusDays: 7   },
-  '#revise_7':    { nextTag: '#revise_30',  plusDays: 30  },
-  '#revise_30':   { nextTag: '#revise_90',  plusDays: 90  },
-  '#revise_90':   { nextTag: '#revise_365', plusDays: 365 },
-  '#revise_365':  { nextTag: '#revise_365', plusDays: 365 }, // yearly self-loop
+  '#revise': { nextTag: '#revise_7', plusDays: 7 },
+  '#revise_7': { nextTag: '#revise_30', plusDays: 30 },
+  '#revise_30': { nextTag: '#revise_90', plusDays: 90 },
+  '#revise_90': { nextTag: '#revise_365', plusDays: 365 },
+  '#revise_365': { nextTag: '#revise_365', plusDays: 365 }, // yearly self-loop
 };
 
 // For fast membership checks if needed later
@@ -40,6 +40,14 @@ const EXTRACT_REVISE_TAG_RE = /(?:#revise_(?:365|90|30|7)\b)|(?:#revise\b)/i;
 
 // Used to strip an existing revise tag (any of the forms)
 const STRIP_REVISE_TAG_RE = /\s+#revise(?:_(?:7|30|90|365))?\b/gi;
+
+// Match #repeat_N where N is a number > 0
+const REPEAT_ANY_RE = /(^|\s)#repeat_(\d+)\b/i;
+// Used to strip an existing repeat tag
+const STRIP_REPEAT_TAG_RE = /\s+#repeat_\d+\b/gi;
+
+// Strip done date token: "✅ YYYY-MM-DD"
+const DONE_DATE_STRIP_RE = /\s*✅\s*\d{4}-\d{2}-\d{2}/g;
 
 const NEXT_SCHEDULED_TAG = '#nextscheduled';
 
@@ -89,7 +97,7 @@ class ReviseSchedulerPlugin extends obsidian.Plugin {
     });
   }
 
-  onunload() {}
+  onunload() { }
 
   _debouncedProcessFile() {
     return debounce((file) => {
@@ -125,33 +133,53 @@ class ReviseSchedulerPlugin extends obsidian.Plugin {
         if (!TASK_DONE_RE.test(line)) continue;
         if (line.includes(NEXT_SCHEDULED_TAG)) continue;
 
-        const tagMatch = line.match(EXTRACT_REVISE_TAG_RE);
-        if (!tagMatch) continue;
+        const reviseMatch = line.match(EXTRACT_REVISE_TAG_RE);
+        const repeatMatch = line.match(REPEAT_ANY_RE);
 
-        const tag = tagMatch[0].toLowerCase();
-        if (!REVISE_SET.has(tag)) continue;
+        let nextTag = '';
+        let plusDays = 0;
 
-        const stage = STAGES[tag];
-        if (!stage) continue;
+        if (reviseMatch) {
+          const tag = reviseMatch[0].toLowerCase();
+          if (REVISE_SET.has(tag)) {
+            const stage = STAGES[tag];
+            nextTag = stage.nextTag;
+            plusDays = stage.plusDays;
+          }
+        }
+
+        // Fallback to repeat tag if no valid revise tag found (or prioritize revise?)
+        // Logic: If we found a valid revise stage, we used it. If not, check repeat.
+        if (!nextTag && repeatMatch) {
+          const days = parseInt(repeatMatch[2], 10);
+          if (!isNaN(days) && days > 0) {
+            nextTag = `#repeat_${days}`;
+            plusDays = days;
+          }
+        }
+
+        if (!nextTag) continue;
 
         // Compute next due date from now
-        const due = obsidian.moment().add(stage.plusDays, 'days').format('YYYY-MM-DD');
+        const due = obsidian.moment().add(plusDays, 'days').format('YYYY-MM-DD');
 
         // Build next open task:
         // 1) Convert to open checkbox
-        // 2) Remove any existing revise tag and any due-like tokens (📅/⏳/➕ YYYY-MM-DD)
+        // 2) Remove any existing revise tag, repeat tag, and any due-like tokens
         // 3) Trim trailing spaces and normalize to ensure "- [ ] " present
         const clonedBase = line
           .replace(TASK_DONE_RE, (m) => m.replace('[x]', '[ ]'))
           .replace(STRIP_REVISE_TAG_RE, '')
-          .replace(DATE_TOKEN_RE, '');
+          .replace(STRIP_REPEAT_TAG_RE, '')
+          .replace(DATE_TOKEN_RE, '')
+          .replace(DONE_DATE_STRIP_RE, '');
 
         const cleaned = clonedBase.replace(/\s+$/, '');
         const openTask = TASK_OPEN_RE.test(cleaned)
           ? cleaned
           : cleaned.replace(/^\s*/, (sp) => `${sp}- [ ] `);
 
-        const nextTaskLine = `${openTask} 📅 ${due} ${stage.nextTag}`.trim();
+        const nextTaskLine = `${openTask} ⏳ ${due} ${nextTag}`.trim();
 
         // Append newly scheduled task directly after the completed one
         out.push(nextTaskLine);

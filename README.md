@@ -37,7 +37,7 @@ When you mark a revise task as completed:
 The plugin automatically creates:
 
 ```
-- [ ] Study Graph Algorithms 📅 2025-11-15 #revise_7
+- [ ] Study Graph Algorithms ⏳ 2025-11-15 #revise_7
 ```
 
 And marks the completed task:
@@ -63,6 +63,26 @@ Default ladder:
 | `#revise_365` | `#revise_365` | 365 days (cycle yearly) |
 
 You can modify the ladder by editing the `STAGES` map in `main.ts`.
+66: 
+67: ---
+68: 
+69: ### ✅ Fixed Interval Repetition (#repeat_N)
+70: 
+71: If you want a task to repeat every N days without following the ladder, use the `#repeat_N` tag (where N is a number > 0).
+72: 
+73: Example:
+74: 
+75: ```
+76: - [x] Water plants #repeat_3
+77: ```
+78: 
+79: Will generate:
+80: 
+81: ```
+82: - [ ] Water plants ⏳ 2025-11-18 #repeat_3
+83: ```
+84: 
+85: This is useful for maintenance tasks or habits that don't need spaced repetition.
 
 ---
 
@@ -143,7 +163,7 @@ Great for cleanup after importing notes or converting tasks.
 
 ```
 - [x] Review Chapter 1 #revise #nextscheduled
-- [ ] Review Chapter 1 📅 2025-11-25 #revise_7
+- [ ] Review Chapter 1 ⏳ 2025-11-25 #revise_7
 ```
 
 ### Step 4 — Continue the ladder

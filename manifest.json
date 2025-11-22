@@ -3,8 +3,7 @@
   "name": "Revise Scheduler",
   "version": "1.1.0",
   "minAppVersion": "1.5.0",
-  "description": "Spaced ladder for #revise → #revise_7 → #revise_30 → #revise_90. Insert initial due +1d; on completion schedule next stage.",
+  "description": "Spaced ladder for #revise tags and fixed intervals for #repeat_N tags. Automatic scheduling on completion.",
   "author": "You",
   "isDesktopOnly": false
 }
-
