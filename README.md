@@ -1,10 +1,3 @@
-Here is a **clean, professional, Obsidian-plugin-style `README.md`** you can drop directly into your repo.
-It reflects your exact revise ladder, duplicate-prevention logic, commands, and plugin behavior.
-
----
-
-# ✅ **README.md**
-
 # Revise Scheduler (Spaced Ladder)
 
 A lightweight, automatic spaced-repetition scheduler for Obsidian tasks.
@@ -208,13 +201,3 @@ const STAGES = {
 ```
 
 Modify regex behavior or duplicate protection as needed.
-
----
-
-## ✅ Roadmap (Optional / Future Ideas)
-
-* Configurable intervals via plugin settings
-* Statistics dashboard (e.g., next 7 / 30 / 90 revisions)
-* One-click ladder assignment from command palette
-* Support for custom ladders per note/category
-
